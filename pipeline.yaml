@@ -1,0 +1,118 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: remote-tests
+spec:
+  # results:
+  #   - name: TEST_OUTPUT
+  #     value: "$(tasks.verify.results.TEST_OUTPUT)"
+  tasks:
+    - name: test
+      params:
+        - name: PLATFORM
+          value: linux-ibm-gpu/amd64
+      taskSpec:
+        params:
+          - description: The platform to execute on
+            name: PLATFORM
+            type: string
+        # results:
+        # - description: unit test results
+        #   name: UNIT_TEST_RESULTS
+        stepTemplate:
+          volumeMounts:
+          - mountPath: "/var/workdir"
+            name: workdir
+        steps:
+        - env:
+          - name: BUILDER_IMAGE
+            value: registry.redhat.io/rhel9/go-toolset
+          image: registry.redhat.io/rhel9/go-toolset
+          name: go-test
+          script: |
+            set -o verbose
+            set -eu
+            set -o pipefail
+            mkdir -p ~/.ssh
+            if [ -e "/ssh/error" ]; then
+              #no server could be provisioned
+              cat /ssh/error
+              exit 1
+            elif [ -e "/ssh/otp" ]; then
+             curl --cacert /ssh/otp-ca -XPOST -d @/ssh/otp $(cat /ssh/otp-server) >~/.ssh/id_rsa
+             echo "" >> ~/.ssh/id_rsa
+            else
+              cp /ssh/id_rsa ~/.ssh
+            fi
+            chmod 0400 ~/.ssh/id_rsa
+            export SSH_HOST=$(cat /ssh/host)
+            export BUILD_DIR=$(cat /ssh/user-dir)
+            export SSH_ARGS="-o StrictHostKeyChecking=no"
+            mkdir -p scripts
+            echo "$BUILD_DIR"
+            ssh $SSH_ARGS "$SSH_HOST"  mkdir -p "$BUILD_DIR/workspaces" "$BUILD_DIR/scripts" "$BUILD_DIR/tmp"
+
+
+            echo -e local arch is: $(arch)
+            echo -e remote arch is:
+            ssh $SSH_ARGS "$SSH_HOST" /bin/bash -c "arch"
+
+            # write the script to disk:
+            cat >scripts/script-build.sh <<'REMOTESSHEOF'
+            #!/bin/bash
+            set -o verbose
+            yum install -y golang
+            echo 'go version'
+            echo -e platform is: $(uname -m)
+
+            # debugging
+            pwd
+            ls -alR
+
+            go version
+
+            REMOTESSHEOF
+
+            # make it executable
+            chmod +x scripts/script-build.sh
+
+            # sync scripts dir to the SSH Host
+            rsync -ra scripts "$SSH_HOST:$BUILD_DIR"
+
+            # copy image pull secrets
+            rsync -ra "$HOME/.docker/" "$SSH_HOST:$BUILD_DIR/.docker/"
+
+            # execute the script in a container on the SSH host
+            ssh $SSH_ARGS "$SSH_HOST" podman  run \
+            -e PARAM_BUILDER_IMAGE="registry.redhat.io/ubi9/ubi" \
+            -v $BUILD_DIR/scripts:/script:Z \
+            -v "$BUILD_DIR/workspaces/source:/source:Z" \
+            --user=0  --rm  "$BUILDER_IMAGE" /script/script-build.sh
+          securityContext:
+            capabilities:
+              add:
+              - SETFCAP
+          volumeMounts:
+          - mountPath: "/var/lib/containers"
+            name: varlibcontainers
+          - mountPath: "/entitlement"
+            name: etc-pki-entitlement
+          - mountPath: /ssh
+            name: ssh
+            readOnly: true
+          workingDir: "/var/workdir"
+        volumes:
+        - emptyDir: {}
+          name: varlibcontainers
+        - name: etc-pki-entitlement
+          secret:
+            optional: true
+            secretName: "$(params.ENTITLEMENT_SECRET)"
+        - emptyDir: {}
+          name: workdir
+        - name: ssh
+          secret:
+            optional: false
+            secretName: multi-platform-ssh-$(context.taskRun.name)
+
